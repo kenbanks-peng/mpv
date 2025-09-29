@@ -14,6 +14,7 @@ typedef struct mp_vo_opts {
     int drag_and_drop;
     bool ontop;
     int ontop_level;
+    bool wallpaper_mode;
     bool fullscreen;
     bool border;
     bool title_bar;

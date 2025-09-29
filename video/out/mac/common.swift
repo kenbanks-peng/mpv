@@ -89,11 +89,37 @@ class Common: NSObject {
             exit(1)
         }
 
-        window.setOnTop(Bool(option.vo.ontop), Int(option.vo.ontop_level))
-        window.setOnAllWorkspaces(Bool(option.vo.all_workspaces))
+        // Configure wallpaper mode settings
+        if option.vo.wallpaper_mode {
+            window.setOnTop(false, -3) // Desktop level
+            window.border = false
+            window.styleMask = .borderless
+            window.level = NSWindow.Level(Int(CGWindowLevelForKey(.desktopWindow)))
+            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenDisallowsTiling]
+            window.ignoresMouseEvents = true
+            window.setOnAllWorkspaces(true)
+            // Prevent minimization by removing miniaturize button
+            window.styleMask.remove(.miniaturizable)
+            // Make window resistant to window managers
+            window.hidesOnDeactivate = false
+            window.canHide = false
+            // Make window unmovable and unresizable
+            window.isMovable = false
+            window.styleMask.remove(.resizable)
+        } else {
+            window.setOnTop(Bool(option.vo.ontop), Int(option.vo.ontop_level))
+            window.setOnAllWorkspaces(Bool(option.vo.all_workspaces))
+            window.border = Bool(option.vo.border)
+            // Keep miniaturization ability for normal mode
+            window.styleMask.insert(.miniaturizable)
+            window.hidesOnDeactivate = false
+            window.canHide = true
+            // Restore normal window behavior
+            window.isMovable = true
+            window.styleMask.insert(.resizable)
+        }
         window.keepAspect = Bool(option.vo.keepaspect_window)
         window.title = title
-        window.border = Bool(option.vo.border)
 
         titleBar = TitleBar(frame: wr, window: window, common: self)
 
@@ -109,13 +135,27 @@ class Common: NSObject {
         view.layer?.contentsScale = window.backingScaleFactor
 
         if !minimized {
-            window.orderFront(nil)
+            if option.vo.wallpaper_mode {
+                DispatchQueue.main.async {
+                    window.orderBack(nil) // Send to back for wallpaper mode
+                }
+            } else {
+                DispatchQueue.main.async {
+                    window.orderFront(nil)
+                }
+            }
         }
 
-        NSApp.activate(ignoringOtherApps: option.vo.focus_on >= 1)
+        // Don't activate app in wallpaper mode
+        if !option.vo.wallpaper_mode {
+            NSApp.activate(ignoringOtherApps: option.vo.focus_on >= 1)
 
-        // workaround for macOS 10.15 to refocus the previous App
-        if option.vo.focus_on == 0 {
+            // workaround for macOS 10.15 to refocus the previous App
+            if option.vo.focus_on == 0 {
+                previousActiveApp?.activate()
+            }
+        } else {
+            // In wallpaper mode, keep previous app active
             previousActiveApp?.activate()
         }
     }
@@ -412,8 +452,10 @@ class Common: NSObject {
     func getWindowGeometry(forScreen screen: NSScreen,
                            videoOut vo: UnsafeMutablePointer<vo>) -> (NSRect, Bool) {
         let r = screen.convertRectToBacking(screen.frame)
-        let targetFrame = option.mac.macos_geometry_calculation == FRAME_VISIBLE
-            ? screen.visibleFrame : screen.frame
+        // In wallpaper mode, always use full screen frame to go behind dock/menu
+        let targetFrame = option.vo.wallpaper_mode ? screen.frame :
+            (option.mac.macos_geometry_calculation == FRAME_VISIBLE
+            ? screen.visibleFrame : screen.frame)
         let rv = screen.convertRectToBacking(targetFrame)
 
         // convert origin to be relative to target screen
@@ -536,6 +578,10 @@ class Common: NSObject {
                 case TypeHelper.toPointer(&option.voPtr.pointee.cursor_passthrough):
                     DispatchQueue.main.async {
                         self.window?.ignoresMouseEvents = self.option.vo.cursor_passthrough
+                    }
+                case TypeHelper.toPointer(&option.voPtr.pointee.wallpaper_mode):
+                    DispatchQueue.main.async {
+                        self.handleWallpaperModeChange()
                     }
                 case TypeHelper.toPointer(&option.voPtr.pointee.geometry),
                      TypeHelper.toPointer(&option.voPtr.pointee.autofit),
@@ -683,6 +729,53 @@ class Common: NSObject {
             default:
                 break
             }
+        }
+    }
+
+    func handleWallpaperModeChange() {
+        guard let window = self.window else { return }
+
+        if option.vo.wallpaper_mode {
+            // Enable wallpaper mode
+            window.setOnTop(false, -3)
+            window.border = false
+            window.styleMask = .borderless
+            window.level = NSWindow.Level(Int(CGWindowLevelForKey(.desktopWindow)))
+            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenDisallowsTiling]
+            window.ignoresMouseEvents = true
+            window.setOnAllWorkspaces(true)
+            // Prevent minimization by removing miniaturize button
+            window.styleMask.remove(.miniaturizable)
+            // Make window resistant to window managers
+            window.hidesOnDeactivate = false
+            window.canHide = false
+            // Make window unmovable and unresizable
+            window.isMovable = false
+            window.styleMask.remove(.resizable)
+            window.orderBack(nil)
+
+            // Use full screen geometry in wallpaper mode
+            if let screen = window.screen, let vo = self.vo {
+                let (newFrame, _) = getWindowGeometry(forScreen: screen, videoOut: vo)
+                window.setFrame(window.frameRect(forContentRect: newFrame), display: true)
+            }
+        } else {
+            // Disable wallpaper mode, restore normal behavior
+            window.setOnTop(Bool(option.vo.ontop), Int(option.vo.ontop_level))
+            window.border = Bool(option.vo.border)
+            window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
+            window.level = .normal
+            window.collectionBehavior = .fullScreenPrimary
+            window.ignoresMouseEvents = option.vo.cursor_passthrough
+            window.setOnAllWorkspaces(Bool(option.vo.all_workspaces))
+            // Restore miniaturization ability
+            window.styleMask.insert(.miniaturizable)
+            window.hidesOnDeactivate = false
+            window.canHide = true
+            // Restore normal window behavior
+            window.isMovable = true
+            window.styleMask.insert(.resizable)
+            window.orderFront(nil)
         }
     }
 }
