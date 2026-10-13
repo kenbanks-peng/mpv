@@ -219,6 +219,13 @@ class Window: NSWindow, NSWindowDelegate {
     }
 
     func endAnimation(_ newFrame: NSRect = NSRect.zero) {
+        guard let _ = self.common else {
+            animationLock.lock()
+            isAnimating = false
+            animationLock.signal()
+            animationLock.unlock()
+            return
+        }
         if newFrame != NSRect.zero && isAnimating {
             NSAnimationContext.runAnimationGroup({ (context) in
                 context.duration = 0.01
@@ -234,6 +241,7 @@ class Window: NSWindow, NSWindowDelegate {
     }
 
     func setToFullScreen() {
+        guard let _ = self.common else { return }
         guard let targetFrame = targetScreen?.frame else { return }
 
         if #available(macOS 11.0, *) {
@@ -253,6 +261,7 @@ class Window: NSWindow, NSWindowDelegate {
     }
 
     func setToWindow() {
+        guard let _ = self.common else { return }
         guard let tScreen = targetScreen else { return }
 
         if #available(macOS 11.0, *) {
@@ -317,12 +326,104 @@ class Window: NSWindow, NSWindowDelegate {
     }
 
     func setMinimized(_ stateWanted: Bool) {
+        guard let _ = self.common else { return }
         if isMiniaturized == stateWanted { return }
+
+        // Prevent minimization in wallpaper mode
+        if common.option.vo.wallpaper_mode && stateWanted {
+            return
+        }
 
         if stateWanted {
             performMiniaturize(self)
         } else {
             deminiaturize(self)
+        }
+    }
+
+    // Override setFrame to prevent programmatic movement in wallpaper mode
+    override func setFrame(_ frameRect: NSRect, display flag: Bool) {
+        guard let _ = self.common else { return }
+        // Size validation (original logic)
+        if frameRect.width < minSize.width || frameRect.height < minSize.height {
+            common.log.verbose("tried to set too small window size: \(frameRect.size)")
+            return
+        }
+
+        if common.option.vo.wallpaper_mode {
+            // In wallpaper mode, only allow frame changes that maintain position
+            let currentFrame = frame
+            if frameRect.origin.x != currentFrame.origin.x || frameRect.origin.y != currentFrame.origin.y {
+                return // Block position changes
+            }
+        }
+
+        super.setFrame(frameRect, display: flag)
+
+        if keepAspect { contentAspectRatio = unfsContentFrame.size }
+    }
+
+    // Override setFrameOrigin to prevent position changes
+    override func setFrameOrigin(_ point: NSPoint) {
+        guard let _ = self.common else { return }
+        if common.option.vo.wallpaper_mode {
+            return // Block all position changes in wallpaper mode
+        }
+        super.setFrameOrigin(point)
+    }
+
+
+    // Override window ordering methods to prevent movement in window stack
+    override func orderFront(_ sender: Any?) {
+        guard let _ = self.common else { return }
+        if common.option.vo.wallpaper_mode {
+            return // Stay in background in wallpaper mode
+        }
+        super.orderFront(sender)
+    }
+
+    override func orderBack(_ sender: Any?) {
+        super.orderBack(sender) // Always allow ordering back
+    }
+
+    override func orderOut(_ sender: Any?) {
+        guard let _ = self.common else { return }
+        if common.option.vo.wallpaper_mode {
+            return // Prevent hiding in wallpaper mode
+        }
+        super.orderOut(sender)
+    }
+
+    // Override minimize/zoom to prevent state changes
+    override func performMiniaturize(_ sender: Any?) {
+        guard let _ = self.common else { return }
+        if common.option.vo.wallpaper_mode {
+            return // Block minimize in wallpaper mode
+        }
+        super.performMiniaturize(sender)
+    }
+
+    override func performZoom(_ sender: Any?) {
+        guard let _ = self.common else { return }
+        if common.option.vo.wallpaper_mode {
+            return // Block zoom in wallpaper mode
+        }
+        super.performZoom(sender)
+    }
+
+    // Override level changes to maintain desktop level in wallpaper mode
+    override var level: NSWindow.Level {
+        get {
+            return super.level
+        }
+        set {
+            guard let _ = self.common else { super.level = newValue; return }
+            if common.option.vo.wallpaper_mode {
+                // Force desktop level in wallpaper mode
+                super.level = NSWindow.Level(Int(CGWindowLevelForKey(.desktopWindow)))
+            } else {
+                super.level = newValue
+            }
         }
     }
 
@@ -343,6 +444,7 @@ class Window: NSWindow, NSWindowDelegate {
     }
 
     func updateFrame(_ rect: NSRect, _ screen: NSScreen? = nil) {
+        guard let _ = self.common else { return }
         if rect != frame {
             unfsContentFrame = rect
             if !isInFullscreen {
@@ -354,22 +456,13 @@ class Window: NSWindow, NSWindowDelegate {
     }
 
     func updateSize(_ size: NSSize) {
+        guard let _ = self.common else { return }
         if let currentSize = contentView?.frame.size, size != currentSize {
             let newContentFrame = centeredContentSize(for: frame, size: size)
             updateFrame(newContentFrame)
         }
     }
 
-    override func setFrame(_ frameRect: NSRect, display flag: Bool) {
-        if frameRect.width < minSize.width || frameRect.height < minSize.height {
-            common.log.verbose("tried to set too small window size: \(frameRect.size)")
-            return
-        }
-
-        super.setFrame(frameRect, display: flag)
-
-        if keepAspect { contentAspectRatio = unfsContentFrame.size }
-    }
 
     func absolutePosition(for rect: NSRect, screen: NSScreen?) -> NSRect {
         guard let tScreen = screen else { return rect }
@@ -466,7 +559,8 @@ class Window: NSWindow, NSWindowDelegate {
 
     override func constrainFrameRect(_ frameRect: NSRect, to tScreen: NSScreen?) -> NSRect {
         if (isAnimating && !isInFullscreen) || (!isAnimating && isInFullscreen ||
-            level == NSWindow.Level(Int(CGWindowLevelForKey(.desktopWindow)))) {
+            level == NSWindow.Level(Int(CGWindowLevelForKey(.desktopWindow))) ||
+            common.option.vo.wallpaper_mode) {
             return frameRect
         }
 

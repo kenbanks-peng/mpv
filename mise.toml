@@ -1,0 +1,20 @@
+[tasks.build]
+description = "Configure and build mpv with Meson"
+run = """
+if [ ! -f build/meson-private/coredata.dat ]; then
+    meson setup build
+fi
+meson compile -C build
+"""
+
+[tasks.deploy]
+description = "Atomically deploy mpv to ./bin/"
+depends = ["build"]
+run = """
+set -eu
+mkdir -p ./bin
+tmp=$(mktemp ./bin/.mpv.XXXXXX)
+trap 'rm -f "$tmp"' EXIT HUP INT TERM
+cp -p ./build/mpv "$tmp"
+mv -f "$tmp" ./bin/mpv
+"""
