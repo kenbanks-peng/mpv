@@ -1,5 +1,10 @@
+[tasks.install]
+description = "Install mpv dependencies with Homebrew"
+run = "brew install --only-dependencies mpv"
+
 [tasks.build]
 description = "Configure and build mpv with Meson"
+depends = ["install"]
 run = """
 if [ ! -f build/meson-private/coredata.dat ]; then
     meson setup build
