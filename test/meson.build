@@ -47,8 +47,8 @@ endif
 
 if features['win32-desktop']
     test_utils_deps += [cc.find_library('imm32'),
-                        cc.find_library('ntdll'),
-                        cc.find_library('pathcch')]
+                        cc.find_library('pathcch'),
+                        cc.find_library('winmm')]
 endif
 test_utils_objects = libmpv.extract_objects(test_utils_files)
 test_utils = static_library('test-utils', 'test_utils.c', include_directories: incdir,
@@ -155,6 +155,11 @@ if get_option('libmpv')
     exe = executable('libmpv-test-options', 'libmpv_test_options.c',
                      include_directories: incdir, dependencies: libmpv_dep)
     test('libmpv-test-options', exe, suite: 'libmpv')
+
+    exe = executable('libmpv-test-aes-ctr', 'libmpv_test_aes_ctr.c',
+                     include_directories: incdir,
+                     dependencies: [libmpv_dep, libavutil])
+    test('libmpv-test-aes-ctr', exe, suite: 'libmpv')
 
     # Old versions of ffmpeg are bugged when setting forced tracks and older
     # versions of meson don't support the custom version checking argument.

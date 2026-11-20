@@ -15,6 +15,8 @@
  * License along with mpv.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <math.h>
+
 #include "common/msg.h"
 #include "options/m_config.h"
 #include "osdep/timer.h"
@@ -86,7 +88,8 @@ const struct m_sub_options d3d11_conf = {
             {"bt.2020", DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020}),
             .flags = UPDATE_VO,
         },
-        {"d3d11-exclusive-fs", OPT_BOOL(exclusive_fs)},
+        {"d3d11-exclusive-fs", OPT_BOOL(exclusive_fs),
+            .flags = UPDATE_BUILTIN_SCRIPTS},
         {"d3d11-output-mode", OPT_CHOICE(output_mode,
             {"auto", -1},
             {"window", 0},
@@ -119,12 +122,12 @@ struct priv {
     ID3D11Device *device;
     IDXGISwapChain *swapchain;
     struct pl_color_space swapchain_csp;
+    BOOL fullscreen_state;
 
     int64_t perf_freq;
     unsigned last_sync_refresh_count;
     int64_t last_sync_qpc_time;
     int64_t vsync_duration_qpc;
-    int64_t last_submit_qpc;
 
     struct mp_dxgi_factory_ctx dxgi_ctx;
 };
@@ -285,11 +288,21 @@ static void d3d11_swap_buffers(struct ra_swapchain *sw)
 
     m_config_cache_update(p->opts_cache);
 
-    LARGE_INTEGER perf_count;
-    QueryPerformanceCounter(&perf_count);
-    p->last_submit_qpc = perf_count.QuadPart;
+    HRESULT hr = IDXGISwapChain_Present(p->swapchain, p->opts->sync_interval, 0);
+    if (hr == S_OK)
+        return;
 
-    IDXGISwapChain_Present(p->swapchain, p->opts->sync_interval, 0);
+    // DXGI leaves exclusive fullscreen by itself during Present(), e.g. when the
+    // window loses the focus, and returns a status then. The buffers must be
+    // resized after that, or the next Present() fails.
+    BOOL fullscreen = FALSE;
+    IDXGISwapChain_GetFullscreenState(p->swapchain, &fullscreen, NULL);
+    if (fullscreen != p->fullscreen_state) {
+        MP_VERBOSE(sw->ctx, "Full-screen exclusive mode was %s by DXGI\n",
+                   fullscreen ? "enabled" : "disabled");
+        p->fullscreen_state = fullscreen;
+        resize(sw->ctx);
+    }
 }
 
 static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
@@ -350,36 +363,38 @@ static void d3d11_get_vsync(struct ra_swapchain *sw, struct vo_vsync_info *info)
         sqt_passed = stats.SyncQPCTime.QuadPart - p->last_sync_qpc_time;
     p->last_sync_qpc_time = stats.SyncQPCTime.QuadPart;
 
-    // If any vsyncs have passed, estimate the physical frame rate
-    if (src_passed && sqt_passed)
+    // The vsync duration estimated from the statistics, the time between
+    // their vsyncs over their refresh count, is off for a window presenting
+    // below the refresh rate, the refresh count skips the vsyncs DWM did not
+    // compose. The VO knows the refresh rate, use its interval and keep the
+    // estimate for a VO without one.
+    double vsync_ns = vo_get_vsync_interval(sw->ctx->vo);
+    if (vsync_ns > 0) {
+        p->vsync_duration_qpc = llrint(vsync_ns * p->perf_freq / 1e9);
+    } else if (src_passed && sqt_passed) {
         p->vsync_duration_qpc = sqt_passed / src_passed;
+    }
     if (p->vsync_duration_qpc)
         info->vsync_duration = qpc_to_ns(sw, p->vsync_duration_qpc);
 
     // If the physical frame rate is known and the other members of
-    // DXGI_FRAME_STATISTICS are non-0, estimate the timing of the next frame
+    // DXGI_FRAME_STATISTICS are non-0, report the vsync of the last displayed
+    // present
     if (p->vsync_duration_qpc && stats.PresentCount &&
         stats.PresentRefreshCount && stats.SyncRefreshCount &&
         stats.SyncQPCTime.QuadPart)
     {
-        // It's not clear if PresentRefreshCount and SyncRefreshCount can refer
-        // to different frames, but in case they can, assuming mpv presents on
-        // every frame, guess the present count that relates to SyncRefreshCount.
-        unsigned expected_sync_pc = stats.PresentCount +
-            (stats.SyncRefreshCount - stats.PresentRefreshCount);
-
-        // Now guess the timestamp of the last submitted frame based on the
-        // timestamp of the frame at SyncRefreshCount and the frame rate
-        int queued_frames = submit_count - expected_sync_pc;
-        int64_t last_queue_display_time_qpc = stats.SyncQPCTime.QuadPart +
-            queued_frames * p->vsync_duration_qpc;
-
-        // Only set the estimated display time if it's after the last submission
-        // time. It could be before if mpv skips a lot of frames.
-        if (last_queue_display_time_qpc >= p->last_submit_qpc) {
-            info->last_queue_display_time = mp_time_ns() +
-                (qpc_to_ns(sw, last_queue_display_time_qpc) - qpc_ns_now(sw));
-        }
+        // The statistics time one vsync, SyncRefreshCount. When the present
+        // went out on that one, its time is exact. When they time a later
+        // one, the present went out as many vsyncs before it as the two
+        // refresh counts differ, as far as the counts go: for a window
+        // presenting below the refresh rate they skip the vsyncs DWM did not
+        // compose.
+        int vsyncs_since = stats.SyncRefreshCount - stats.PresentRefreshCount;
+        int64_t displayed_qpc = stats.SyncQPCTime.QuadPart - vsyncs_since * p->vsync_duration_qpc;
+        info->displayed_time = mp_time_ns() + (qpc_to_ns(sw, displayed_qpc) - qpc_ns_now(sw));
+        info->displayed_age = submit_count - stats.PresentCount;
+        info->displayed_estimated = vsyncs_since != 0;
     }
 }
 
@@ -409,6 +424,7 @@ static bool d3d11_set_fullscreen(struct ra_ctx *ctx)
                                            enable_exclusive_fs, NULL);
     if (FAILED(hr))
         return false;
+    p->fullscreen_state = enable_exclusive_fs;
 
     if (!resize(ctx))
         return false;
@@ -465,12 +481,28 @@ static int d3d11_control(struct ra_ctx *ctx, int *events, int request, void *arg
         if (!resize(ctx))
             return VO_ERROR;
     }
+
+    if (!ctx->opts.composition && (*events & VO_EVENT_FOCUS) &&
+        !p->fullscreen_state && p->vo_opts->fullscreen && p->opts->exclusive_fs)
+    {
+        bool focused = false;
+        int focus_events = 0;
+        vo_w32_control(ctx->vo, &focus_events, VOCTRL_GET_FOCUSED, &focused);
+        if (focused)
+            d3d11_set_fullscreen(ctx);
+    }
+
     return ret;
 }
 
 static void d3d11_uninit(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
+
+    IDXGIDebug *debug = NULL;
+    IDXGIInfoQueue *iqueue = NULL;
+    if (p->device && (ID3D11Device_GetCreationFlags(p->device) & D3D11_CREATE_DEVICE_DEBUG))
+        mp_d3d11_get_debug_interfaces(ctx->log, &debug, &iqueue);
 
     if (p->swapchain)
         IDXGISwapChain_SetFullscreenState(p->swapchain, FALSE, NULL);
@@ -490,6 +522,11 @@ static void d3d11_uninit(struct ra_ctx *ctx)
     // leak checker
     if (ctx->ra)
         ctx->ra->fns->destroy(ctx->ra);
+
+    if (debug)
+        mp_d3d11_report_live_objects(ctx->log, debug, iqueue);
+    SAFE_RELEASE(debug);
+    SAFE_RELEASE(iqueue);
 }
 
 static const struct ra_swapchain_fns d3d11_swapchain = {

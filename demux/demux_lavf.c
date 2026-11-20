@@ -180,6 +180,7 @@ static const struct format_hack format_hacks[] = {
     {"hls", .nested_network = true, .clear_filepos = true, .no_ext_picky = true},
     {"dash", .nested_network = true, .clear_filepos = true},
     {"sdp", .clear_filepos = true, .is_network = true, .no_seek = true},
+    {"rtp", .clear_filepos = true, .is_network = true, .no_seek = true},
     {"mpeg", .use_stream_ids = true},
     {"mpegts", .use_stream_ids = true},
     {"mxf", .use_stream_ids = true},
@@ -236,8 +237,15 @@ struct stream_info {
     struct mp_dovi_split *dovi_split;
 };
 
+struct avio_cookie {
+    const AVClass *av_class;
+    struct demuxer *demuxer;
+    const char *location;
+};
+
 typedef struct lavf_priv {
     struct stream *stream;
+    struct avio_cookie avio_cookie;
     bool own_stream;
     bool is_dvd_bd;
     bool is_dvd;
@@ -306,9 +314,34 @@ static bool matches_avinputformat_name(struct lavf_priv *priv,
     }
 }
 
+static const AVClass avio_cookie_class = {
+    .class_name = "mpv_avio",
+    .item_name  = av_default_item_name,
+    .option     = (const AVOption[]) {
+        {"location", "The actual location of the data received",
+         offsetof(struct avio_cookie, location),
+         AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, AV_OPT_FLAG_DECODING_PARAM},
+        {0}
+    },
+    .version = LIBAVUTIL_VERSION_INT,
+};
+
+static void *avio_child_next(void *obj, void *prev)
+{
+    AVIOContext *pb = obj;
+    return prev ? NULL : pb->opaque;
+}
+
+static const AVClass avio_class = {
+    .class_name = "mpv_avio",
+    .item_name  = av_default_item_name,
+    .child_next = avio_child_next,
+    .version    = LIBAVUTIL_VERSION_INT,
+};
+
 static int mp_read(void *opaque, uint8_t *buf, int size)
 {
-    struct demuxer *demuxer = opaque;
+    struct demuxer *demuxer = ((struct avio_cookie *)opaque)->demuxer;
     lavf_priv_t *priv = demuxer->priv;
     struct stream *stream = priv->stream;
     if (!stream)
@@ -323,7 +356,7 @@ static int mp_read(void *opaque, uint8_t *buf, int size)
 
 static int64_t mp_seek(void *opaque, int64_t pos, int whence)
 {
-    struct demuxer *demuxer = opaque;
+    struct demuxer *demuxer = ((struct avio_cookie *)opaque)->demuxer;
     lavf_priv_t *priv = demuxer->priv;
     struct stream *stream = priv->stream;
     if (!stream)
@@ -365,7 +398,7 @@ static int64_t mp_seek(void *opaque, int64_t pos, int whence)
 
 static int64_t mp_read_seek(void *opaque, int stream_idx, int64_t ts, int flags)
 {
-    struct demuxer *demuxer = opaque;
+    struct demuxer *demuxer = ((struct avio_cookie *)opaque)->demuxer;
     lavf_priv_t *priv = demuxer->priv;
     struct stream *stream = priv->stream;
 
@@ -485,7 +518,7 @@ static int lavf_check_file(demuxer_t *demuxer, enum demux_check check)
         .filename = !bstrcasecmp0(ext, "m3u8") || !bstrcasecmp0(ext, "m3u") ||
                     check <= DEMUX_CHECK_REQUEST ? priv->filename : "",
         .buf_size = 0,
-        .buf = av_mallocz(PROBE_BUF_SIZE + AV_INPUT_BUFFER_PADDING_SIZE),
+        .buf = av_malloc(PROBE_BUF_SIZE + AV_INPUT_BUFFER_PADDING_SIZE),
         .mime_type = lavfdopts->allow_mimetype ? mime_type : NULL,
     };
     if (!avpd.buf)
@@ -502,6 +535,7 @@ static int lavf_check_file(demuxer_t *demuxer, enum demux_check check)
             int nsize = av_clip(avpd.buf_size * 2, INITIAL_PROBE_SIZE,
                                 PROBE_BUF_SIZE);
             nsize = stream_read_peek(s, avpd.buf, nsize);
+            memset(avpd.buf + nsize, 0, AV_INPUT_BUFFER_PADDING_SIZE);
             if (nsize <= avpd.buf_size)
                 final_probe = true;
             avpd.buf_size = nsize;
@@ -1487,12 +1521,20 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
         void *buffer = av_malloc(lavfdopts->buffersize);
         if (!buffer)
             goto fail;
+        const char *location = priv->stream->effective_url;
+        priv->avio_cookie = (struct avio_cookie){
+            .av_class = &avio_cookie_class,
+            .demuxer = demuxer,
+            .location = location ? location : priv->filename,
+        };
         priv->pb = avio_alloc_context(buffer, lavfdopts->buffersize, 0,
-                                      demuxer, mp_read, NULL, mp_seek);
+                                      &priv->avio_cookie, mp_read, NULL,
+                                      mp_seek);
         if (!priv->pb) {
             av_free(buffer);
             goto fail;
         }
+        priv->pb->av_class = &avio_class;
         priv->pb->read_seek = mp_read_seek;
         priv->pb->seekable = demuxer->seekable ? AVIO_SEEKABLE_NORMAL : 0;
         avfc->pb = priv->pb;
@@ -1593,6 +1635,10 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
             if (par->codec_type == AVMEDIA_TYPE_AUDIO && par->format == AV_SAMPLE_FMT_DSD)
                 av_dict_set(&opts[i], "request_sample_fmt", "dsd", 0);
         }
+#endif
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+        for (int i = 0; i < nb_streams; i++)
+            av_dict_set_int(&opts[i], "max_pixels", 2048 * 2048, 0);
 #endif
         int r = avformat_find_stream_info(avfc, opts);
         for (int i = 0; i < nb_streams; i++)
@@ -1850,7 +1896,8 @@ static void demux_drop_buffers_lavf(demuxer_t *demuxer)
     if (!priv->stream || priv->stream->seekable)
         av_seek_frame(priv->avfc, -1, 0, 1);
     demux_flush(demuxer);
-    stream_drop_buffers(priv->stream);
+    if (priv->stream)
+        stream_drop_buffers(priv->stream);
     avio_flush(priv->avfc->pb);
     if (priv->stream && !priv->stream->seekable) {
         // The stream may have been repositioned externally (disc seeks).
@@ -1902,7 +1949,8 @@ static void demux_seek_lavf(demuxer_t *demuxer, double seek_pts, int flags)
     } else {
         if (!(flags & SEEK_FORWARD))
             seek_pts -= priv->seek_delay;
-        seek_pts_av = seek_pts * AV_TIME_BASE;
+        seek_pts_av = MPCLAMP(seek_pts, INT64_MIN / AV_TIME_BASE,
+                              INT64_MAX / AV_TIME_BASE) * AV_TIME_BASE;
     }
 
     // Hack to make wav seeking "deterministic". Without this, features like
@@ -1924,8 +1972,8 @@ static void demux_seek_lavf(demuxer_t *demuxer, double seek_pts, int flags)
                       priv->pcm_seek_hack->codecpar->block_align;
         if (samples > 0) {
             MP_VERBOSE(demuxer, "using bullshit libavformat PCM seek hack\n");
-            double pts = seek_pts_av / (double)AV_TIME_BASE;
-            seek_pts_av = pts / av_q2d(priv->pcm_seek_hack->time_base);
+            seek_pts_av = av_rescale_q(seek_pts_av, AV_TIME_BASE_Q,
+                                       priv->pcm_seek_hack->time_base);
             int64_t align = seek_pts_av % samples;
             seek_pts_av -= align;
             seek_stream = priv->pcm_seek_hack->index;

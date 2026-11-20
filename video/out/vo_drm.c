@@ -41,6 +41,7 @@
 
 struct drm_frame {
     struct framebuffer *fb;
+    int64_t swap;           // the swap that queued the frame
 };
 
 struct priv {
@@ -108,6 +109,10 @@ static struct framebuffer *setup_framebuffer(struct vo *vo)
     case DRM_OPTS_FORMAT_XBGR8888:
         p->drm_format = DRM_FORMAT_XBGR8888;
         p->imgfmt = IMGFMT_RGB0;
+        break;
+    case DRM_OPTS_FORMAT_RGB565:
+        p->drm_format = DRM_FORMAT_RGB565;
+        p->imgfmt = IMGFMT_RGB565;
         break;
     case DRM_OPTS_FORMAT_YUYV:
         p->drm_format = DRM_FORMAT_YUYV;
@@ -256,6 +261,7 @@ static void enqueue_frame(struct vo *vo, struct framebuffer *fb)
 
     struct drm_frame *new_frame = talloc(p, struct drm_frame);
     new_frame->fb = fb;
+    new_frame->swap = vo->drm->present->swaps + 1;
     MP_TARRAY_APPEND(p, p->fb_queue, p->fb_queue_len, new_frame);
 }
 
@@ -303,6 +309,7 @@ static void queue_flip(struct vo *vo, struct drm_frame *frame)
     struct vo_drm_state *drm = vo->drm;
 
     drm->fb = frame->fb;
+    drm->flip_swap = frame->swap;
 
     int ret = drmModePageFlip(drm->fd, drm->crtc_id,
                               drm->fb->id, DRM_MODE_PAGE_FLIP_EVENT, drm);
@@ -319,6 +326,7 @@ static void flip_page(struct vo *vo)
     if (!drm->active)
         return;
 
+    present_sync_swap(drm->present);
     while (drm->redraw || p->fb_queue_len > vo->opts->swapchain_depth) {
         if (drm->waiting_for_flip) {
             vo_drm_wait_on_flip(vo->drm);
@@ -384,6 +392,7 @@ static int preinit(struct vo *vo)
                vo->drm->connector->connector_id, mp_strerror(errno));
         goto err;
     }
+    enqueue_frame(vo, p->bufs[0]);
 
     vo_drm_set_monitor_par(vo);
     p->sws = mp_sws_alloc(vo);
